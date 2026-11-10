@@ -39,6 +39,10 @@ python app.py image.png -v
 
 # JSON output (for integration)
 python app.py image.png --json
+
+# Enable the neural classifier with a TRAINED checkpoint
+# (without --model the classifier is skipped on purpose; see Known Limitations)
+python app.py image.png --model path/to/ai_detector.pth
 ```
 
 ## Example Output
@@ -122,9 +126,12 @@ Final Verdict: AI / UNCERTAIN / REAL
 
 ---
 
-### 2. **Neural Network Classifier** (Weight: 2.5) - Reliable
+### 2. **Neural Network Classifier** (Weight: 2.5) - Opt-in
 
-**What it does**: Uses ResNet18 to classify the image
+**What it does**: Uses ResNet18 to classify the image. **Disabled by default** —
+the ResNet18 head is randomly initialized, so an untrained model outputs
+meaningless, non-reproducible scores. Pass a trained checkpoint with `--model`
+to enable it; otherwise it is excluded from the weighted score entirely.
 
 **AI Indicators**:
 
@@ -134,7 +141,9 @@ Final Verdict: AI / UNCERTAIN / REAL
 
 - Direct probability (0.0 to 1.0)
 
-**Limitation**: Current model is not specifically trained for AI detection, so results vary. For production, use a trained AI detector model.
+**Limitation**: No trained checkpoint ships with this repo. Train a head on an
+AI-vs-real dataset and pass it via `--model`. Until then the classifier stays off
+and the verdict rests on the forensic signals only.
 
 ---
 
@@ -491,7 +500,7 @@ CONFIDENCE:  27.88%
 
 ### Current Limitations
 
-1. **Untrained Classifier**: The ResNet18 model is not specifically trained for AI detection, causing inconsistent results
+1. **Classifier needs training**: No trained checkpoint ships with the repo; the classifier is off unless you pass one via `--model`. Forensic heuristics carry the verdict by default.
 2. **Modern AI Generators**: Latest models (DALL-E 3, Midjourney v6) are getting very sophisticated
 3. **Post-Processing**: Heavily edited AI images are harder to detect
 4. **Classifier Variance**: Same image may get slightly different scores on different runs
@@ -630,7 +639,7 @@ pip install -r requirements.txt
 
 ### Issue: Inconsistent classifier results
 
-**Solution**: This is expected with the untrained model. For consistent results, use a trained AI detector model.
+**Solution**: The classifier is disabled unless you pass a trained checkpoint via `--model`. Without it the run is fully deterministic (classifier skipped). With it, results are consistent as long as the checkpoint is fixed.
 
 ### Issue: Slow processing
 

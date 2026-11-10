@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import argparse
+import io
 import re
+import sys
 import piexif
 import numpy as np
 from PIL import Image, ImageChops, ImageFilter
@@ -8,9 +10,7 @@ from torchvision import transforms, models
 import torch
 import torch.nn as nn
 from scipy.fft import fft2, fftshift
-from scipy import stats
 import warnings
-import os
 warnings.filterwarnings("ignore")
 
 
@@ -59,7 +59,7 @@ def check_metadata(path):
 
         flag = any(_metadata_contains_keyword(metadata_text, k) for k in keywords)
         return flag, exif_data
-    except:
+    except Exception:
         return False, None
 
 
@@ -83,25 +83,20 @@ def noise_score(img):
 # ---------------------------------------------------------
 def ela_score(img):
     """Analyze compression artifacts - AI images often have low ELA"""
-    TEMP = "temp_ela.jpg"
-
     # Force RGB
     img = img.convert("RGB")
 
-    img.save(TEMP, "JPEG", quality=95)
-    compressed = Image.open(TEMP).convert("RGB")
+    # Recompress in-memory (no temp file -> reentrant, no CWD pollution)
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=95)
+    buf.seek(0)
+    compressed = Image.open(buf).convert("RGB")
 
     ela_img = ImageChops.difference(img, compressed)
 
     extrema = ela_img.getextrema()
     max_diff = max([x[1] for x in extrema])
-    
-    # Clean up temp file
-    try:
-        os.remove(TEMP)
-    except:
-        pass
-    
+
     return max_diff
 
 
@@ -240,14 +235,22 @@ def chromatic_aberration_score(img):
     r_edges = sobel(r)
     g_edges = sobel(g)
     b_edges = sobel(b)
-    
+
+    def _safe_corr(a, b):
+        # corrcoef returns NaN when either input is constant (e.g. flat color).
+        # Treat a degenerate channel as perfectly aligned (corr=1.0).
+        if a.std() == 0 or b.std() == 0:
+            return 1.0
+        c = np.corrcoef(a.flatten(), b.flatten())[0, 1]
+        return 1.0 if np.isnan(c) else c
+
     # Calculate correlation between channel edges
     # Real photos have slight misalignment (lower correlation)
     # AI images have perfect alignment (higher correlation)
-    rg_corr = np.corrcoef(r_edges.flatten(), g_edges.flatten())[0,1]
-    rb_corr = np.corrcoef(r_edges.flatten(), b_edges.flatten())[0,1]
-    gb_corr = np.corrcoef(g_edges.flatten(), b_edges.flatten())[0,1]
-    
+    rg_corr = _safe_corr(r_edges, g_edges)
+    rb_corr = _safe_corr(r_edges, b_edges)
+    gb_corr = _safe_corr(g_edges, b_edges)
+
     avg_corr = (rg_corr + rb_corr + gb_corr) / 3
     
     # Return inverse - higher correlation = more AI-like
@@ -268,8 +271,22 @@ class AIDetector(nn.Module):
         return self.softmax(self.model(x))
 
 
-def load_model():
+def load_model(checkpoint):
+    """Load the classifier head from a trained checkpoint.
+
+    The ResNet18 head (fc) is randomly initialized, so WITHOUT a trained
+    checkpoint the classifier output is meaningless noise (and non-reproducible
+    across runs). We only use the classifier when a real checkpoint is provided.
+    Returns None if no usable checkpoint -> caller excludes it from scoring.
+    """
+    if not checkpoint:
+        return None
     model = AIDetector()
+    state = torch.load(checkpoint, map_location="cpu")
+    # Accept either a raw state_dict or a {"state_dict": ...} wrapper.
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+    model.load_state_dict(state)
     model.eval()
     return model
 
@@ -310,9 +327,23 @@ def main():
     parser.add_argument("image", help="Path to image")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--verbose", "-v", action="store_true", help="Show detailed analysis")
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="Path to a TRAINED classifier checkpoint (.pt/.pth). "
+             "Without it the neural classifier is skipped, since an untrained "
+             "head produces random, meaningless output.",
+    )
     args = parser.parse_args()
 
-    img = Image.open(args.image).convert("RGB")
+    try:
+        img = Image.open(args.image).convert("RGB")
+    except FileNotFoundError:
+        print(f"Error: file not found: {args.image}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: could not open image '{args.image}': {e}", file=sys.stderr)
+        sys.exit(1)
 
     # --- METADATA ---
     meta_flag, meta = check_metadata(args.image)
@@ -341,9 +372,14 @@ def main():
     # --- CHROMATIC ABERRATION ---
     chrom_aber = chromatic_aberration_score(img)
 
-    # --- CLASSIFIER ---
-    model = load_model()
-    ai_prob = classify_ai(model, img)
+    # --- CLASSIFIER (only if a trained checkpoint is supplied) ---
+    try:
+        model = load_model(args.model)
+    except Exception as e:
+        print(f"Warning: could not load checkpoint '{args.model}': {e}; "
+              f"skipping classifier.", file=sys.stderr)
+        model = None
+    ai_prob = classify_ai(model, img) if model is not None else None
 
     # ---------------------------------------------------------
     # WEIGHTED SCORING SYSTEM
@@ -363,14 +399,20 @@ def main():
         'jpeg_art': 1.0      # Weak indicator
     }
     
+    # Drop the classifier entirely when no trained checkpoint was loaded,
+    # so an untrained (random) head never pollutes the weighted score.
+    if ai_prob is None:
+        weights = {k: v for k, v in weights.items() if k != 'classifier'}
+
     scores = {}
-    
+
     # Metadata (binary)
     scores['metadata'] = 1.0 if meta_flag else 0.0
-    
+
     # Classifier (direct probability)
-    scores['classifier'] = ai_prob
-    
+    if ai_prob is not None:
+        scores['classifier'] = ai_prob
+
     # FFT - AI images typically have FFT < 10 (based on your test results)
     # Real images typically > 15
     if fft_val < 7:
@@ -479,7 +521,7 @@ def main():
     
     # Multiple weak signals can indicate AI - Enhanced detection
     # Rule 1: FFT, ELA, and classifier all suggest AI
-    if (fft_val < 10 and ela_val < 100 and ai_prob > 0.55):
+    if (ai_prob is not None and fft_val < 10 and ela_val < 100 and ai_prob > 0.55):
         if final_score >= 0.30:
             verdict = "AI" if verdict != "AI" else verdict
             color_code = "31"
@@ -514,7 +556,7 @@ def main():
             "high_frequency_noise": float(hf_noise),
             "texture_consistency": float(texture_cons),
             "chromatic_aberration": float(chrom_aber),
-            "classifier_ai_probability": float(ai_prob),
+            "classifier_ai_probability": float(ai_prob) if ai_prob is not None else None,
             "final_score": float(final_score),
             "confidence": float(confidence),
             "verdict": str(verdict)
@@ -535,7 +577,10 @@ def main():
     print(f"  High-Frequency Noise:       {hf_noise:.4f} {'[!] (Low - AI-like)' if hf_noise < 1000 else '[OK] (Normal)'}")
     print(f"  Texture Consistency:        {texture_cons:.4f} {'[!] (Abnormal)' if (texture_cons < 150 or texture_cons > 800) else '[OK] (Normal)'}")
     print(f"  Chromatic Aberration:       {chrom_aber:.4f} {'[!] (High - AI-like)' if chrom_aber > 0.94 else '[OK] (Normal)'}")
-    print(f"  Classifier AI Probability:  {ai_prob:.2f} {'[!] (High)' if ai_prob > 0.6 else '[OK] (Low)'}")
+    if ai_prob is None:
+        print(f"  Classifier AI Probability:  {color('SKIPPED (no trained checkpoint; use --model)', '33')}")
+    else:
+        print(f"  Classifier AI Probability:  {ai_prob:.2f} {'[!] (High)' if ai_prob > 0.6 else '[OK] (Low)'}")
     
     if args.verbose:
         print(f"\nDETAILED SCORING:")
